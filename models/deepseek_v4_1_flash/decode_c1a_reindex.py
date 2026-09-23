@@ -25,6 +25,8 @@ if __package__ in (None, ""):
 # ci: no-sim
 # ci: a5
 
+from models.deepseek_v4_1_flash import config as C
+
 import pypto.language as pl
 import pypto.language.distributed as pld
 
@@ -588,6 +590,82 @@ if "pytest" in sys.modules:
         """Validate the operator against its golden reference on A5."""
         result = validate(a5_args(tp=tp, dp=dp))
         assert result.passed, result.error
+
+
+DECODER_SLAB = ((C.DECODER_CAPACITY + C.TP_SIZE - 1) // C.TP_SIZE) if C.DECODER_CAPACITY else 1
+
+@pl.jit
+def decoder_c1a_reindex_rank(
+    x_hc: pl.Tensor[[OUTPUT_T_DYN, HC_MULT, D], pl.FP32],
+    pre_mix: pl.Tensor[[OUTPUT_T_DYN, HC_MULT], pl.FP32],
+    hc_attn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
+    hc_attn_scale: pl.Tensor[[3], pl.FP32],
+    hc_attn_base: pl.Tensor[[MIX_HC], pl.FP32],
+    attn_norm_weight: pl.Tensor[[D], pl.BF16],
+    wq_a: pl.Tensor[[D, Q_LORA], pl.FP8E4M3FN],
+    wq_a_scale: pl.Tensor[[D // 32, Q_LORA], pl.FP8E8M0, pl.MX_B_NN],
+    q_norm_weight: pl.Tensor[[Q_LORA], pl.BF16],
+    wq_b: pl.Tensor[[Q_LORA, LOCAL_H * HEAD_DIM], pl.FP8E4M3FN],
+    wq_b_scale: pl.Tensor[[Q_LORA // 32, LOCAL_H * HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN],
+    wkv: pl.Tensor[[D, HEAD_DIM], pl.FP8E4M3FN],
+    wkv_scale: pl.Tensor[[D // 32, HEAD_DIM], pl.FP8E8M0, pl.MX_B_NN],
+    kv_norm_weight: pl.Tensor[[HEAD_DIM], pl.BF16],
+    attn_sink: pl.Tensor[[LOCAL_H], pl.FP32],
+    wo_a: pl.Tensor[[LOCAL_O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
+    wo_b: pl.Tensor[[LOCAL_O_WIDTH, D], pl.FP8E4M3FN],
+    wo_b_scale: pl.Tensor[[LOCAL_O_WIDTH // 32, D], pl.FP8E8M0, pl.MX_B_NN],
+    rope_cos: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+    rope_sin: pl.Tensor[[T_DYN, ROPE_DIM // 2], pl.FP32],
+    window_slots: pl.Tensor[[T_DYN], pl.INT64],
+    window_indices: pl.Tensor[[T_DYN, 128], pl.INT32],
+    window_cache: pl.InOut[pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM], pl.FP8E4M3FN]],
+    window_cache_scale: pl.InOut[pl.Tensor[[ORI_BLOCKS_DYN, 128, 1, HEAD_DIM // WINDOW_CACHE_GROUP], pl.FP8E8M0]],
+    compressed_cache: pl.InOut[pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // 2], pl.UINT8]],
+    compressed_cache_scale: pl.InOut[pl.Tensor[[CMP_BLOCKS_DYN, 128, 1, HEAD_DIM // COMPRESSED_CACHE_GROUP], pl.FP8E4M3FN]],
+    request_ids: pl.Tensor[[T_DYN], pl.INT32],
+    compressed_lens: pl.Tensor[[T_DYN], pl.INT32],
+    index_cache: pl.InOut[pl.Tensor[[INDEX_BLOCKS_DYN, 128, 1, INDEX_DIM // 2], pl.UINT8]],
+    index_cache_scale: pl.InOut[pl.Tensor[[INDEX_BLOCKS_DYN, 128, 1, INDEX_DIM // INDEX_CACHE_GROUP], pl.FP8E8M0]],
+    index_block_table: pl.Tensor[[B_DYN, TABLE_DYN], pl.INT32],
+    candidate_mask: pl.InOut[pl.Tensor[[T_DYN, CMP_POSITIONS_DYN], pl.UINT8]],
+    index_wq_b: pl.Tensor[[Q_LORA, INDEX_H * INDEX_DIM], pl.FP8E4M3FN],
+    index_wq_b_scale: pl.Tensor[[Q_LORA // 32, INDEX_H * INDEX_DIM], pl.FP8E8M0, pl.MX_B_NN],
+    index_weights_proj: pl.Tensor[[D, INDEX_H], pl.BF16],
+    topk_indices: pl.Out[pl.Tensor[[T_DYN, INDEX_TOPK], pl.INT32]],
+    gathered: pl.InOut[pl.Tensor[[T_DYN, D], pl.BF16]],
+    input_window: pld.DistributedTensor[[DECODE_MAX_TOKENS, D], pl.BF16],
+    input_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
+    output_window: pld.DistributedTensor[[DECODE_MAX_TOKENS, D], pl.FP32],
+    output_arrived: pld.DistributedTensor[[TP_SIZE, 1], pl.INT32],
+    output: pl.Out[pl.Tensor[[OUTPUT_T_DYN, HC_MULT, D], pl.FP32]],
+    next_pre_mix: pl.Out[pl.Tensor[[OUTPUT_T_DYN, HC_MULT], pl.FP32]],
+    active_tokens: pl.Tensor[[C.DP_SIZE], pl.INT32],
+    global_rank: pl.Scalar[pl.INT32],
+    attention_epoch: pl.Scalar[pl.INT32],
+):
+    """Bind a DP batch to the existing sequence-parallel attention composition."""
+    # The annotations already name every dynamic dimension, so no
+    # ``bind_dynamic`` call is needed here: a bare-name binding makes the JIT
+    # specializer invent a second symbol for the same dim (its name fallback),
+    # which then cannot be proven equal to the annotated DynVar across calls.
+    num_tokens = pl.read(active_tokens, [global_rank // TP_SIZE])
+    decode_c1a_reindex_sharded(x_hc, pre_mix, hc_attn_fn, hc_attn_scale, hc_attn_base, attn_norm_weight, wq_a, wq_a_scale, q_norm_weight, wq_b, wq_b_scale, wkv, wkv_scale, kv_norm_weight, attn_sink, wo_a, wo_b, wo_b_scale, rope_cos, rope_sin, window_slots, window_indices, window_cache, window_cache_scale, compressed_cache, compressed_cache_scale, request_ids, compressed_lens, index_cache, index_cache_scale, index_block_table, candidate_mask, index_wq_b, index_wq_b_scale, index_weights_proj, topk_indices, gathered, input_window, input_arrived, output_window, output_arrived, output, next_pre_mix, (global_rank // TP_SIZE) * TP_SIZE, global_rank % TP_SIZE, num_tokens, attention_epoch)
+    _, owned = slab_owner(global_rank % TP_SIZE, pl.tensor.dim(x_hc, 0), num_tokens)
+    with pl.spmd(pl.tensor.dim(x_hc, 0), name_hint="decoder_attention_padding"):
+        row = pl.tile.get_block_idx()
+        if row >= owned:
+            output[row:row + 1, :, :] = pl.full([1, HC_MULT, D], dtype=pl.FP32, value=0.0)
+    # A four-wide FP32 row is 16 bytes, below the 32-byte tile row the backend
+    # requires, so the delayed pre-mix padding rows use scalar writes from a
+    # single block (no two blocks share a 64-byte line).
+    with pl.spmd(1, name_hint="decoder_pre_mix_padding"):
+        pad_first = pl.tile.get_block_idx()
+        for pad_row in pl.range(pad_first, pl.tensor.dim(x_hc, 0)):
+            if pad_row >= owned:
+                for pad_col in pl.range(HC_MULT):
+                    pl.write(next_pre_mix, [pad_row, pad_col], pl.cast(0.0, pl.FP32))
+    return output, next_pre_mix
+
 
 if __name__ == _SCRIPT_ENTRY_POINT:
     main()

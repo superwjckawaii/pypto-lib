@@ -94,6 +94,23 @@ def load_decode_attention_module(kind: DecodeLayerKind):
     return import_module(f"models.deepseek_v4_1_flash.{module_name}")
 
 
+def resolve_decoder_plan(start_layer: int = 20, stop_layer: int = 40) -> tuple[DecodeLayerPlan, ...]:
+    """Resolve a contiguous C1A segment; non-Full starts require supplied selections."""
+    if not 20 <= start_layer < stop_layer <= 40:
+        raise ValueError("decoder layers must form a nonempty interval inside [20, 40)")
+    return tuple(resolve_decode_layer_plan(layer) for layer in range(start_layer, stop_layer))
+
+
+def load_decode_composition_module(kind: DecodeLayerKind):
+    """Discover mHC composition separately from the attention-only reference ABI."""
+    name = {
+        DecodeLayerKind.C1A_FULL: "decode_c1a_full",
+        DecodeLayerKind.C1A_REINDEX: "decode_c1a_reindex",
+        DecodeLayerKind.C1A_REUSE: "decode_c1a_reuse",
+    }.get(kind, MODE_MODULES[kind])
+    return import_module(f"models.deepseek_v4_1_flash.{name}")
+
+
 __all__ = [
     "DecodeLayerKind",
     "DecodeLayerPlan",

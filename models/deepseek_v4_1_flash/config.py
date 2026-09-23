@@ -350,6 +350,18 @@ DECODE_RECV_MAX = DP_SIZE * DECODE_MAX_TOKENS
 PREFILL_RECV_MAX = DP_SIZE * PREFILL_MAX_TOKENS
 RECV_MAX = PREFILL_RECV_MAX
 MOE_TOKENS = 16
+# Decoder capacity is selected before importing any shape-specialized kernels.
+# Standalone entries retain their historical capacity unless explicitly selected.
+DECODER_CAPACITY = _parse_parallel_size("decoder-capacity", 0)
+if DECODER_CAPACITY:
+    if not 1 <= DECODER_CAPACITY <= MAX_BATCH_PER_DP:
+        raise ValueError(f"--decoder-capacity must be in [1, {MAX_BATCH_PER_DP}]")
+    _decoder_slab = (DECODER_CAPACITY + TP_SIZE - 1) // TP_SIZE
+    MOE_TOKENS = ((_decoder_slab + 15) // 16) * 16
+    # Dispatch addresses fixed per-source lanes, including each padded suffix.
+    RECV_MAX = EP_SIZE * MOE_TOKENS
+elif DECODER_CAPACITY < 0:
+    raise ValueError("--decoder-capacity must be non-negative")
 AUX_WIDTH = 8
 ROUTE_WIDTH = 8
 WINDOW_CACHE_GROUP = 32
