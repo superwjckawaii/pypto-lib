@@ -139,6 +139,9 @@ def build_forward_metadata(
     window_block_table: torch.Tensor,
     compressed_block_tables: Mapping[int, torch.Tensor],
     state_block_tables: Mapping[int, torch.Tensor],
+    *,
+    source_layer_ids: tuple[int, ...] | None = None,
+    owner_slab_size: int | None = None,
 ) -> ForwardMetadata:
     """Lower engine inputs for packed prefill or one-token-per-request decode."""
     if query_start_loc.ndim != 1 or kv_seq_lens.ndim != 1:
@@ -150,8 +153,17 @@ def build_forward_metadata(
         raise ValueError("query_start_loc must be nondecreasing and start at zero")
     if bool((kv_seq_lens < 0).any()):
         raise ValueError("kv_seq_lens must be non-negative")
+    sources = FLASH.kv_source_layer_ids if source_layer_ids is None else source_layer_ids
+    if not sources or len(set(sources)) != len(sources) or any(
+        source not in FLASH.kv_source_layer_ids for source in sources
+    ):
+        raise ValueError("source_layer_ids must be a nonempty subset of KV sources")
+    if owner_slab_size is not None and (
+        owner_slab_size <= 0 or int(query_start_loc[-1]) > owner_slab_size * TP_SIZE
+    ):
+        raise ValueError("owner slab capacity cannot contain the query rows")
     tables_by_ratio: dict[int, torch.Tensor] = {}
-    for source in FLASH.kv_source_layer_ids:
+    for source in sources:
         if source not in compressed_block_tables:
             raise ValueError(f"missing compressed block table for source layer {source}")
         ratio = FLASH.compress_ratios[source]
@@ -175,7 +187,7 @@ def build_forward_metadata(
     compressor_positions: dict[int, torch.Tensor] = {}
     compressed_rope_positions: dict[int, torch.Tensor] = {}
     new_kv_seq_lens = kv_seq_lens.to(torch.int64) + query_lens
-    for source in FLASH.kv_source_layer_ids:
+    for source in sources:
         ratio = FLASH.compress_ratios[source]
         storage_rows = BLOCK_SIZE
         table = compressed_block_tables[source]
@@ -226,9 +238,13 @@ def build_forward_metadata(
         query_lens=query_lens.to(torch.int32),
         logit_row_indices=logit_rows,
         token_to_req_indices=request_ids,
-        moe_token_owners=torch.arange(
-            request_ids.numel(), device=request_ids.device, dtype=torch.int32
-        ).remainder(TP_SIZE),
+        moe_token_owners=(
+            torch.arange(request_ids.numel(), device=request_ids.device, dtype=torch.int32)
+            .remainder(TP_SIZE)
+            if owner_slab_size is None else
+            torch.arange(request_ids.numel(), device=request_ids.device, dtype=torch.int32)
+            .div(owner_slab_size, rounding_mode="floor")
+        ),
         position_ids=positions.to(torch.int32),
         kv_seq_lens=kv_seq_lens.to(torch.int32),
         new_kv_seq_lens=new_kv_seq_lens.to(torch.int32),

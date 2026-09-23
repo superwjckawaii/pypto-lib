@@ -130,6 +130,7 @@ Once a kernel body lands, its owner can extend the same file with the thin
 | Decoder C1A Reindex | `prefill_attn_c1a_reindex.py`, `decode_attn_c1a_reindex.py` (leaf), `prefill_c1a_reindex.py`, `decode_c1a_reindex.py` (HC orchestration) |
 | Decoder C1A Reuse | `prefill_attn_c1a_reuse.py`, `decode_attn_c1a_reuse.py` (leaf), `prefill_c1a_reuse.py`, `decode_c1a_reuse.py` (HC orchestration) |
 | Hierarchical indexer | `hierarchical_sparse_indexer.py` |
+| Decoder layers 20-39 | `decode_decoder.py` (host, fixtures, independent chain golden, staged comparators); design and acceptance contract in [decode_decoder_plan.md](decode_decoder_plan.md) |
 | Hyper-connections | `hc_mixes.py`, `hc_pre.py`, `hc_post.py` |
 | Attention TP transports | `attention_tp.py` |
 | Shared Attention primitives | `attention_ops.py` (`make_mx_projection`, BF16 projection, RMSNorm, RoPE, and dependency-aware variants) |

@@ -9,13 +9,51 @@
 """Mode-independent decode Attention half-layer boundaries and validation helpers."""
 
 import argparse
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from types import SimpleNamespace
 
 from pathlib import Path
 
 import pypto.language as pl
 import torch
+
+
+@dataclass(frozen=True)
+class DecoderLayout:
+    """Physical owner and transport capacities for one-token-per-request decode."""
+
+    capacity: int
+    tp: int = 4
+    ep: int = 8
+
+    def __post_init__(self):
+        if self.capacity <= 0 or self.tp <= 0 or self.ep <= 0 or self.ep % self.tp:
+            raise ValueError("positive capacity and an EP world divisible by TP are required")
+
+    @property
+    def dp(self):
+        return self.ep // self.tp
+
+    @property
+    def slab(self):
+        return (self.capacity + self.tp - 1) // self.tp
+
+    @property
+    def moe_capacity(self):
+        return ((self.slab + 15) // 16) * 16
+
+    @property
+    def receive_capacity(self):
+        return self.ep * self.moe_capacity
+
+    def counts(self, active_tokens):
+        active = torch.as_tensor(active_tokens, dtype=torch.int32)
+        if active.shape != (self.dp,) or bool(((active < 0) | (active > self.capacity)).any()):
+            raise ValueError("active_tokens must contain one valid count per DP group")
+        return torch.tensor([
+            max(0, min(self.slab, int(active[r // self.tp]) - (r % self.tp) * self.slab))
+            for r in range(self.ep)
+        ], dtype=torch.int32)
 
 from golden import ScalarSpec, TensorSpec, ratio_allclose, run
 from models.deepseek_v4_1_flash import config as C
